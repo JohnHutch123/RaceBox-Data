@@ -1,0 +1,30 @@
+name: Tests
+
+# Runs the protocol and session tests with Free Pascal on a GitHub-hosted
+# runner. The Bluetooth unit and the VCL demo need Delphi; build those with
+# Tests\RunTests.bat on a Windows machine with RAD Studio.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fpc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git init -q .
+          git fetch -q --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+      - name: Install Free Pascal
+        run: sudo apt-get update -q && sudo apt-get install -y -q fp-compiler
+      - name: Build and run tests
+        run: |
+          mkdir -p out
+          fpc -Mdelphi -FuSource -FUout -FEout Tests/RaceBoxProtocolTest.dpr
+          out/RaceBoxProtocolTest
