@@ -486,6 +486,24 @@ begin
       end).Start;
 end;
 
+{ For the log: the UUIDs of the services Windows reported. }
+function ServiceList(Device: TBluetoothLEDevice): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  try
+    for I := 0 to Device.Services.Count - 1 do
+    begin
+      if Result <> '' then Result := Result + ', ';
+      Result := Result + GUIDToString(Device.Services[I].UUID);
+    end;
+  except
+    on E: Exception do Result := Result + ' (' + E.Message + ')';
+  end;
+  if Result = '' then Result := '(none)';
+end;
+
 function TRaceBoxClient.IsCurrentAttempt(Attempt: Integer): Boolean;
 begin
   Result := TInterlocked.CompareExchange(FConnectAttempt, 0, 0) = Attempt;
@@ -516,10 +534,14 @@ begin
   try
     try
       FWorkerThreadId := TThread.Current.ThreadID;
+      Log(Format('Step 1/3: discovering services (address %s)...', [Device.Address]));
       // On Windows this opens the GATT connection and returns when the
       // services are known.
       OK := Device.DiscoverServices;
       if not Alive.IsAlive or not IsCurrentAttempt(Attempt) then Exit;
+      Log(Format('Step 1/3 done after %d ms: result %s, %d service(s): %s',
+        [TThread.GetTickCount64 - FConnectStartTick, BoolToStr(OK, True),
+         Device.Services.Count, ServiceList(Device)]));
       if not OK then
       begin
         FailConnect(Attempt, 'Could not connect to the RaceBox (service discovery failed). ' +
@@ -585,10 +607,12 @@ begin
     FailConnect(Attempt, 'RaceBox UART characteristics not found.');
     Exit;
   end;
-  Log('Services found, turning on notifications...');
+  Log('Step 2/3: turning on RaceBox notifications...');
   // Data arrives as notifications on TX, reported through OnCharacteristicRead.
   OK := Device.SetCharacteristicNotification(Tx, True);
   if not Alive.IsAlive or not IsCurrentAttempt(Attempt) then Exit;
+  Log(Format('Step 2/3 done after %d ms: result %s',
+    [TThread.GetTickCount64 - FConnectStartTick, BoolToStr(OK, True)]));
   if not OK then
   begin
     FailConnect(Attempt, 'Could not subscribe to RaceBox notifications.');
@@ -602,7 +626,7 @@ begin
       FRxChar := Rx;
       FTxChar := Tx;
       SetState(rcsConnected);
-      if Assigned(FOnLog) then FOnLog(Self, 'Connected to ' + Device.DeviceName + '.');
+      if Assigned(FOnLog) then FOnLog(Self, 'Step 3/3: connected to ' + Device.DeviceName + '.');
       if Assigned(FOnConnected) then FOnConnected(Self);
     end);
   ReadDeviceInfo(Device, Attempt, Alive);
