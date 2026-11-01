@@ -73,6 +73,12 @@ type
     FLastLive: TRaceBoxSample;
     FModel, FSerial, FFirmware, FHardware: string;
     FUartUUID, FRxUUID, FTxUUID: TBluetoothUUID;
+    FConnectAttempt: Integer;
+    FSetupStarted: Integer;
+    FWorkerThreadId: TThreadID;
+    FConnectStartTick: UInt64;
+    FConnectTimeoutMs: Cardinal;
+    FOnStateChanged: TNotifyEvent;
 
     FOnDeviceFound: TRaceBoxDeviceFoundEvent;
     FOnScanDone: TNotifyEvent;
@@ -100,7 +106,14 @@ type
     procedure RequireConnected;
     procedure ProcessPacket(const P: TRaceBoxPacket);
     procedure FinishDownload;
-    procedure ReadDeviceInfo;
+    procedure ReadDeviceInfo(Device: TBluetoothLEDevice; Attempt: Integer; const Alive: IRaceBoxAlive);
+    function IsCurrentAttempt(Attempt: Integer): Boolean;
+    procedure ConnectWorker(Device: TBluetoothLEDevice; Attempt: Integer; const Alive: IRaceBoxAlive);
+    procedure ConnectWatchdog(Attempt: Integer; const Alive: IRaceBoxAlive);
+    procedure SetupUart(Device: TBluetoothLEDevice; Attempt: Integer; const Alive: IRaceBoxAlive);
+    procedure FailConnect(Attempt: Integer; const Msg: string);
+    class procedure CloseLinkInBackground(Device: TBluetoothLEDevice;
+      Tx: TBluetoothGattCharacteristic); static;
 
     procedure DoDiscoverDevice(const Sender: TObject; const ADevice: TBluetoothLEDevice;
       Rssi: Integer; const ScanResponse: TScanResponse);
@@ -120,10 +133,13 @@ type
     function DeviceCount: Integer;
     function DeviceNameAt(Index: Integer): string;
 
-    { Connection }
+    { Connection. Connect returns at once; OnConnected or OnError follows.
+      Disconnect also cancels a connect that is still in progress. }
     procedure Connect(Index: Integer); overload;
     procedure Connect(Device: TBluetoothLEDevice); overload;
     procedure Disconnect;
+    { Milliseconds since Connect, while State = rcsConnecting (else 0). }
+    function ConnectElapsedMs: UInt64;
 
     { Commands. Replies arrive as events. }
     procedure RequestRecordingStatus;
@@ -162,6 +178,10 @@ type
     property NameFilter: string read FNameFilter write FNameFilter;
     { Split sessions when samples are further apart than this (0 = only on start/stop). }
     property MaxGapSeconds: Double read FMaxGapSeconds write FMaxGapSeconds;
+    { Give up connecting after this long (default 30 s, 0 = wait forever). }
+    property ConnectTimeoutMs: Cardinal read FConnectTimeoutMs write FConnectTimeoutMs;
+    { Fires whenever State changes: use it to show busy cursors, enable buttons. }
+    property OnStateChanged: TNotifyEvent read FOnStateChanged write FOnStateChanged;
 
     property OnDeviceFound: TRaceBoxDeviceFoundEvent read FOnDeviceFound write FOnDeviceFound;
     property OnScanDone: TNotifyEvent read FOnScanDone write FOnScanDone;
@@ -185,6 +205,9 @@ type
 implementation
 
 uses
+{$IFDEF MSWINDOWS}
+  Winapi.Windows, Winapi.ActiveX,
+{$ENDIF}
   System.StrUtils;
 
 type
@@ -227,6 +250,7 @@ begin
   FSyncEvents := True;
   FNameFilter := 'RaceBox';
   FMaxGapSeconds := 300;
+  FConnectTimeoutMs := 30000;
   FUartUUID := StringToGUID(RB_UUID_UART_SERVICE);
   FRxUUID := StringToGUID(RB_UUID_UART_RX);
   FTxUUID := StringToGUID(RB_UUID_UART_TX);
@@ -235,11 +259,18 @@ end;
 destructor TRaceBoxClient.Destroy;
 begin
   FAlive.Kill;               // queued events for this client now do nothing
+  TInterlocked.Increment(FConnectAttempt);    // stop any connect worker
+  if FDevice <> nil then
   try
-    Disconnect;
+    FDevice.OnServicesDiscovered := nil;
+    FDevice.OnCharacteristicRead := nil;
+    if FTxChar <> nil then
+      FDevice.SetCharacteristicNotification(FTxChar, False);
+    FDevice.Disconnect;
   except
     // never raise from a destructor
   end;
+  FDevice := nil;
   if FManager <> nil then
   begin
     FManager.OnDiscoverLEDevice := nil;
@@ -298,7 +329,13 @@ end;
 
 procedure TRaceBoxClient.SetState(Value: TRaceBoxClientState);
 begin
+  if FState = Value then Exit;
   FState := Value;
+  Post(
+    procedure
+    begin
+      if Assigned(FOnStateChanged) then FOnStateChanged(Self);
+    end);
 end;
 
 function TRaceBoxClient.GetConnected: Boolean;
@@ -396,17 +433,22 @@ begin
   Connect(FDevices[Index]);
 end;
 
+{ Connecting runs on a worker thread: on Windows, DiscoverServices, turning on
+  notifications and reading characteristics each wait for the radio, which can
+  take many seconds and used to freeze the window. Every change to FDevice and
+  the characteristic fields still happens on the main thread (through Post).
+  FConnectAttempt goes up on every connect, disconnect and timeout, so a worker
+  that finishes late can tell its result is no longer wanted. }
 procedure TRaceBoxClient.Connect(Device: TBluetoothLEDevice);
+var
+  Attempt: Integer;
+  Alive: IRaceBoxAlive;
 begin
   if Device = nil then
     raise EArgumentNilException.Create('Device is nil');
   if FDevice <> nil then
     Disconnect;
   StopScan;
-  FDevice := Device;
-  FRxChar := nil;
-  FTxChar := nil;
-  FUartService := nil;
   FModel := '';
   FSerial := '';
   FFirmware := '';
@@ -417,60 +459,194 @@ begin
   finally
     FLock.Leave;
   end;
-  FDevice.OnServicesDiscovered := DoServicesDiscovered;
-  FDevice.OnCharacteristicRead := DoCharacteristicRead;
+  FDevice := Device;
+  FRxChar := nil;
+  FTxChar := nil;
+  FUartService := nil;
+  FSetupStarted := 0;
+  Attempt := TInterlocked.Increment(FConnectAttempt);
+  Alive := FAlive;
+  FConnectStartTick := TThread.GetTickCount64;
+  Device.OnServicesDiscovered := DoServicesDiscovered;
+  Device.OnCharacteristicRead := DoCharacteristicRead;
   SetState(rcsConnecting);
-  Log('Connecting to ' + FDevice.DeviceName + '...');
-  // On Windows, discovering the services opens the GATT connection.
-  if not FDevice.DiscoverServices then
-  begin
-    SetState(rcsIdle);
-    FDevice := nil;
-    raise Exception.Create('Could not connect to the RaceBox (service discovery failed). ' +
-      'Make sure it is switched on, close the RaceBox phone app, and try again.');
+  Log('Connecting to ' + Device.DeviceName + '...');
+
+  TThread.CreateAnonymousThread(
+    procedure
+    begin
+      ConnectWorker(Device, Attempt, Alive);
+    end).Start;
+
+  if FConnectTimeoutMs > 0 then
+    TThread.CreateAnonymousThread(
+      procedure
+      begin
+        ConnectWatchdog(Attempt, Alive);
+      end).Start;
+end;
+
+function TRaceBoxClient.IsCurrentAttempt(Attempt: Integer): Boolean;
+begin
+  Result := TInterlocked.CompareExchange(FConnectAttempt, 0, 0) = Attempt;
+end;
+
+function TRaceBoxClient.ConnectElapsedMs: UInt64;
+begin
+  if FState = rcsConnecting then
+    Result := TThread.GetTickCount64 - FConnectStartTick
+  else
+    Result := 0;
+end;
+
+{ The client can be freed while this thread waits on the radio, so check
+  Alive before touching any field after a long call. }
+procedure TRaceBoxClient.ConnectWorker(Device: TBluetoothLEDevice; Attempt: Integer;
+  const Alive: IRaceBoxAlive);
+var
+  OK: Boolean;
+{$IFDEF MSWINDOWS}
+  ComOK: Boolean;
+{$ENDIF}
+begin
+{$IFDEF MSWINDOWS}
+  // The Windows Bluetooth classes use WinRT, which needs COM on this thread.
+  ComOK := Succeeded(CoInitializeEx(nil, COINIT_MULTITHREADED));
+{$ENDIF}
+  try
+    try
+      FWorkerThreadId := TThread.Current.ThreadID;
+      // On Windows this opens the GATT connection and returns when the
+      // services are known.
+      OK := Device.DiscoverServices;
+      if not Alive.IsAlive or not IsCurrentAttempt(Attempt) then Exit;
+      if not OK then
+      begin
+        FailConnect(Attempt, 'Could not connect to the RaceBox (service discovery failed). ' +
+          'Make sure it is switched on and the RaceBox phone app is closed, then try again.');
+        Exit;
+      end;
+      SetupUart(Device, Attempt, Alive);
+    except
+      on E: Exception do
+        if Alive.IsAlive then
+          FailConnect(Attempt, 'Connecting failed: ' + E.Message);
+    end;
+  finally
+    if Alive.IsAlive and (FWorkerThreadId = TThread.Current.ThreadID) then
+      FWorkerThreadId := 0;
+{$IFDEF MSWINDOWS}
+    if ComOK then CoUninitialize;
+{$ENDIF}
   end;
+end;
+
+procedure TRaceBoxClient.ConnectWatchdog(Attempt: Integer; const Alive: IRaceBoxAlive);
+begin
+  while Alive.IsAlive and IsCurrentAttempt(Attempt) and (FState = rcsConnecting) do
+  begin
+    if TThread.GetTickCount64 - FConnectStartTick > FConnectTimeoutMs then
+    begin
+      FailConnect(Attempt, Format('No answer from the RaceBox after %d seconds. ' +
+        'Switch it off and on, make sure the phone app is not connected to it, and try again.',
+        [FConnectTimeoutMs div 1000]));
+      Exit;
+    end;
+    TThread.Sleep(200);
+  end;
+end;
+
+{ Runs on the worker thread (or the Bluetooth thread on platforms where
+  services are discovered asynchronously). }
+procedure TRaceBoxClient.SetupUart(Device: TBluetoothLEDevice; Attempt: Integer;
+  const Alive: IRaceBoxAlive);
+var
+  Svc: TBluetoothGattService;
+  Rx, Tx: TBluetoothGattCharacteristic;
+  OK: Boolean;
+begin
+  if TInterlocked.CompareExchange(FSetupStarted, 1, 0) <> 0 then Exit;  // already running
+  Svc := Device.GetService(FUartUUID);
+  if Svc = nil then
+  begin
+    if Device.Services.Count = 0 then
+    begin
+      // Not discovered yet; OnServicesDiscovered will call us again.
+      TInterlocked.Exchange(FSetupStarted, 0);
+      Exit;
+    end;
+    FailConnect(Attempt, 'This device has no RaceBox UART service.');
+    Exit;
+  end;
+  Rx := Svc.GetCharacteristic(FRxUUID);
+  Tx := Svc.GetCharacteristic(FTxUUID);
+  if (Rx = nil) or (Tx = nil) then
+  begin
+    FailConnect(Attempt, 'RaceBox UART characteristics not found.');
+    Exit;
+  end;
+  Log('Services found, turning on notifications...');
+  // Data arrives as notifications on TX, reported through OnCharacteristicRead.
+  OK := Device.SetCharacteristicNotification(Tx, True);
+  if not Alive.IsAlive or not IsCurrentAttempt(Attempt) then Exit;
+  if not OK then
+  begin
+    FailConnect(Attempt, 'Could not subscribe to RaceBox notifications.');
+    Exit;
+  end;
+  Post(
+    procedure
+    begin
+      if not IsCurrentAttempt(Attempt) or (FDevice <> Device) then Exit;
+      FUartService := Svc;
+      FRxChar := Rx;
+      FTxChar := Tx;
+      SetState(rcsConnected);
+      if Assigned(FOnLog) then FOnLog(Self, 'Connected to ' + Device.DeviceName + '.');
+      if Assigned(FOnConnected) then FOnConnected(Self);
+    end);
+  ReadDeviceInfo(Device, Attempt, Alive);
+end;
+
+{ Abandons a connect attempt; the clean-up runs on the main thread. }
+procedure TRaceBoxClient.FailConnect(Attempt: Integer; const Msg: string);
+begin
+  // Invalidate the attempt now so the worker and watchdog stop caring.
+  if TInterlocked.CompareExchange(FConnectAttempt, Attempt + 1, Attempt) <> Attempt then Exit;
+  Post(
+    procedure
+    var
+      Device: TBluetoothLEDevice;
+    begin
+      Device := FDevice;
+      if Device <> nil then
+      begin
+        Device.OnServicesDiscovered := nil;
+        Device.OnCharacteristicRead := nil;
+        FDevice := nil;
+        FRxChar := nil;
+        FTxChar := nil;
+        FUartService := nil;
+        CloseLinkInBackground(Device, nil);
+      end;
+      SetState(rcsIdle);
+      if Assigned(FOnError) then FOnError(Self, Msg)
+      else if Assigned(FOnLog) then FOnLog(Self, 'Error: ' + Msg);
+    end);
 end;
 
 procedure TRaceBoxClient.DoServicesDiscovered(const Sender: TObject;
   const AServiceList: TBluetoothGattServiceList);
-var
-  Device: TBluetoothLEDevice;
 begin
-  Device := FDevice;
-  if (Device = nil) or (FTxChar <> nil) then Exit;   // already set up
-  FUartService := Device.GetService(FUartUUID);
-  if FUartService = nil then
-  begin
-    SetState(rcsIdle);
-    Error('This device has no RaceBox UART service.');
-    Exit;
-  end;
-  FRxChar := FUartService.GetCharacteristic(FRxUUID);
-  FTxChar := FUartService.GetCharacteristic(FTxUUID);
-  if (FRxChar = nil) or (FTxChar = nil) then
-  begin
-    SetState(rcsIdle);
-    Error('RaceBox UART characteristics not found.');
-    Exit;
-  end;
-  // Data arrives as notifications on TX, reported through OnCharacteristicRead.
-  if not Device.SetCharacteristicNotification(FTxChar, True) then
-  begin
-    SetState(rcsIdle);
-    Error('Could not subscribe to RaceBox notifications.');
-    Exit;
-  end;
-  SetState(rcsConnected);
-  Log('Connected to ' + Device.DeviceName + '.');
-  Post(
-    procedure
-    begin
-      if Assigned(FOnConnected) then FOnConnected(Self);
-    end);
-  ReadDeviceInfo;
+  // On Windows this fires inside DiscoverServices on the worker thread, which
+  // carries on with SetupUart itself once DiscoverServices returns.
+  if TThread.Current.ThreadID = FWorkerThreadId then Exit;
+  if (Sender is TBluetoothLEDevice) and (TBluetoothLEDevice(Sender) = FDevice) then
+    SetupUart(TBluetoothLEDevice(Sender), TInterlocked.CompareExchange(FConnectAttempt, 0, 0), FAlive);
 end;
 
-procedure TRaceBoxClient.ReadDeviceInfo;
+procedure TRaceBoxClient.ReadDeviceInfo(Device: TBluetoothLEDevice; Attempt: Integer;
+  const Alive: IRaceBoxAlive);
 const
   Ids: array[0..3] of string = (RB_UUID_DEVINFO_MODEL, RB_UUID_DEVINFO_SERIAL,
     RB_UUID_DEVINFO_FIRMWARE, RB_UUID_DEVINFO_HARDWARE);
@@ -479,43 +655,83 @@ var
   Ch: TBluetoothGattCharacteristic;
   I: Integer;
 begin
-  if FDevice = nil then Exit;
-  Svc := FDevice.GetService(StringToGUID(RB_UUID_DEVINFO_SERVICE));
-  if Svc = nil then Exit;
-  for I := Low(Ids) to High(Ids) do
-  begin
-    Ch := Svc.GetCharacteristic(StringToGUID(Ids[I]));
-    if Ch <> nil then
-      FDevice.ReadCharacteristic(Ch);   // answer arrives in DoCharacteristicRead
+  try
+    Svc := Device.GetService(StringToGUID(RB_UUID_DEVINFO_SERVICE));
+    if Svc = nil then Exit;
+    for I := Low(Ids) to High(Ids) do
+    begin
+      if not Alive.IsAlive or not IsCurrentAttempt(Attempt) then Exit;
+      Ch := Svc.GetCharacteristic(StringToGUID(Ids[I]));
+      if Ch <> nil then
+        Device.ReadCharacteristic(Ch);   // answer arrives in DoCharacteristicRead
+    end;
+  except
+    // Model/serial/firmware are nice to have; never fail the connection over them.
   end;
+end;
+
+{ Turning notifications off and dropping the link can also wait on the radio,
+  so do it on a throwaway thread. Uses only its parameters, never Self. }
+class procedure TRaceBoxClient.CloseLinkInBackground(Device: TBluetoothLEDevice;
+  Tx: TBluetoothGattCharacteristic);
+begin
+  TThread.CreateAnonymousThread(
+    procedure
+{$IFDEF MSWINDOWS}
+    var
+      ComOK: Boolean;
+{$ENDIF}
+    begin
+{$IFDEF MSWINDOWS}
+      ComOK := Succeeded(CoInitializeEx(nil, COINIT_MULTITHREADED));
+{$ENDIF}
+      try
+        try
+          if Tx <> nil then
+            Device.SetCharacteristicNotification(Tx, False);
+        except
+          // the link may already be gone
+        end;
+        try
+          Device.Disconnect;
+        except
+        end;
+      finally
+{$IFDEF MSWINDOWS}
+        if ComOK then CoUninitialize;
+{$ENDIF}
+      end;
+    end).Start;
 end;
 
 procedure TRaceBoxClient.Disconnect;
 var
   Device: TBluetoothLEDevice;
-  WasConnected: Boolean;
+  WasConnected, WasConnecting: Boolean;
 begin
   Device := FDevice;
   if Device = nil then Exit;
+  TInterlocked.Increment(FConnectAttempt);    // cancels a connect in progress
   WasConnected := FState in [rcsConnected, rcsDownloading, rcsErasing];
-  try
-    if FTxChar <> nil then
-      Device.SetCharacteristicNotification(FTxChar, False);
-  except
-    // the link may already be gone
-  end;
+  WasConnecting := FState = rcsConnecting;
   Device.OnServicesDiscovered := nil;
   Device.OnCharacteristicRead := nil;
-  try
-    Device.Disconnect;
-  except
-  end;
+  CloseLinkInBackground(Device, FTxChar);
   FDevice := nil;
   FRxChar := nil;
   FTxChar := nil;
   FUartService := nil;
+  FLock.Enter;
+  try
+    FreeAndNil(FSplitter);
+  finally
+    FLock.Leave;
+  end;
   SetState(rcsIdle);
-  Log('Disconnected.');
+  if WasConnecting then
+    Log('Connect cancelled.')
+  else
+    Log('Disconnected.');
   if WasConnected then
     Post(
       procedure

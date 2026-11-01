@@ -34,10 +34,16 @@ type
     FLog: TMemo;
     FProgress: TProgressBar;
     FStatus: TStatusBar;
+    FBusyTimer: TTimer;
+    FBusyStart: UInt64;
+    FConnectingTo: string;
 
     function AddButton(const ACaption: string; ALeft, ATop: Integer; AClick: TNotifyEvent): TButton;
     procedure BuildUI;
     procedure UpdateButtons;
+    procedure UpdateBusy;
+    procedure BusyTimerTick(Sender: TObject);
+    procedure ClientStateChanged(Sender: TObject);
     procedure ShowSessions(ASessions: TRaceBoxSessionList);
     function SelectedSessions: TList;
 
@@ -180,6 +186,12 @@ begin
   AddColumn('Distance km', 90);
   AddColumn('Max km/h', 80);
   AddColumn('Pauses', 60);
+
+  // Ticks while scanning or connecting so the user sees the seconds go by.
+  FBusyTimer := TTimer.Create(Self);
+  FBusyTimer.Enabled := False;
+  FBusyTimer.Interval := 250;
+  FBusyTimer.OnTimer := BusyTimerTick;
 end;
 
 procedure TFormRaceBox.FormCreate(Sender: TObject);
@@ -199,11 +211,14 @@ begin
   FClient.OnDownloadComplete := ClientDownloadComplete;
   FClient.OnLog := ClientLog;
   FClient.OnError := ClientError;
+  FClient.OnStateChanged := ClientStateChanged;
   UpdateButtons;
 end;
 
 procedure TFormRaceBox.FormDestroy(Sender: TObject);
 begin
+  FBusyTimer.Enabled := False;
+  Screen.Cursor := crDefault;
   FClient.Free;
   FSessions.Free;
 end;
@@ -219,9 +234,61 @@ begin
   FBtnStatus.Enabled := St = rcsConnected;
   FBtnUnlock.Enabled := St = rcsConnected;
   FBtnDownload.Enabled := St = rcsConnected;
-  FBtnCancel.Enabled := St = rcsDownloading;
+  FBtnCancel.Enabled := St in [rcsConnecting, rcsDownloading];
   FBtnSaveCsv.Enabled := FSessions.Count > 0;
   FBtnSaveRaw.Enabled := (St <> rcsDownloading) and (FSessions.Count > 0);
+end;
+
+{ Busy indicator: arrow-with-hourglass cursor (the window stays usable, so
+  Cancel can still be pressed), a moving progress bar and elapsed seconds. }
+procedure TFormRaceBox.UpdateBusy;
+var
+  St: TRaceBoxClientState;
+  Waiting: Boolean;
+begin
+  St := FClient.State;
+  Waiting := St in [rcsScanning, rcsConnecting];
+  if Waiting or (St in [rcsDownloading, rcsErasing]) then
+    Screen.Cursor := crAppStart
+  else
+    Screen.Cursor := crDefault;
+  if Waiting then
+  begin
+    if not FBusyTimer.Enabled then
+    begin
+      FBusyStart := TThread.GetTickCount64;
+      FProgress.Style := pbstMarquee;
+      FProgress.MarqueeInterval := 30;
+      FBusyTimer.Enabled := True;
+    end;
+    BusyTimerTick(nil);
+  end
+  else if FBusyTimer.Enabled then
+  begin
+    FBusyTimer.Enabled := False;
+    FProgress.Style := pbstNormal;
+    FProgress.Position := 0;
+  end;
+end;
+
+procedure TFormRaceBox.BusyTimerTick(Sender: TObject);
+var
+  Secs: Integer;
+begin
+  Secs := (TThread.GetTickCount64 - FBusyStart) div 1000;
+  case FClient.State of
+    rcsScanning:
+      FStatus.SimpleText := Format('Scanning for RaceBox devices... %d s', [Secs]);
+    rcsConnecting:
+      FStatus.SimpleText := Format('Connecting to %s... %d s  (first connect can take 10-20 s; Cancel to stop, gives up after %d s)',
+        [FConnectingTo, Secs, FClient.ConnectTimeoutMs div 1000]);
+  end;
+end;
+
+procedure TFormRaceBox.ClientStateChanged(Sender: TObject);
+begin
+  UpdateBusy;
+  UpdateButtons;
 end;
 
 { ---------------------------------------------------------------- buttons }
@@ -230,15 +297,18 @@ procedure TFormRaceBox.BtnScanClick(Sender: TObject);
 begin
   FDevices.Clear;
   FClient.StartScan(8000);
-  FStatus.SimpleText := 'Scanning... switch the RaceBox on and close the RaceBox phone app.';
+  UpdateBusy;
   UpdateButtons;
+  ClientLog(Self, 'Scanning... switch the RaceBox on and close the RaceBox phone app.');
 end;
 
 procedure TFormRaceBox.BtnConnectClick(Sender: TObject);
 begin
-  if FDevices.ItemIndex < 0 then Exit;
+  if (FDevices.ItemIndex < 0) or (FClient.State <> rcsIdle) then Exit;
+  FConnectingTo := FClient.DeviceNameAt(Integer(NativeInt(FDevices.Items.Objects[FDevices.ItemIndex])));
+  // Returns at once; the connection is made on a background thread.
   FClient.Connect(Integer(NativeInt(FDevices.Items.Objects[FDevices.ItemIndex])));
-  FStatus.SimpleText := 'Connecting...';
+  UpdateBusy;
   UpdateButtons;
 end;
 
@@ -276,7 +346,13 @@ end;
 
 procedure TFormRaceBox.BtnCancelClick(Sender: TObject);
 begin
-  FClient.CancelDownload;
+  if FClient.State = rcsConnecting then
+  begin
+    FClient.Disconnect;
+    FStatus.SimpleText := 'Connect cancelled.';
+  end
+  else
+    FClient.CancelDownload;
 end;
 
 function TFormRaceBox.SelectedSessions: TList;
