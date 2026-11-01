@@ -486,6 +486,43 @@ begin
       end).Start;
 end;
 
+{ On Windows a service's characteristics are only fetched from the device the
+  first time the Characteristics list is read; GetCharacteristic(UUID) on its
+  own just searches the (still empty) list. So read the list first. }
+function FindCharacteristic(Svc: TBluetoothGattService; const UUID: TBluetoothUUID): TBluetoothGattCharacteristic;
+var
+  List: TBluetoothGattCharacteristicList;
+  I: Integer;
+begin
+  Result := nil;
+  List := Svc.Characteristics;          // triggers the fetch
+  if List <> nil then
+    for I := 0 to List.Count - 1 do
+      if IsEqualGUID(List[I].UUID, UUID) then
+        Exit(List[I]);
+  Result := Svc.GetCharacteristic(UUID);
+end;
+
+function CharacteristicList(Svc: TBluetoothGattService): string;
+var
+  List: TBluetoothGattCharacteristicList;
+  I: Integer;
+begin
+  Result := '';
+  try
+    List := Svc.Characteristics;
+    if List <> nil then
+      for I := 0 to List.Count - 1 do
+      begin
+        if Result <> '' then Result := Result + ', ';
+        Result := Result + GUIDToString(List[I].UUID);
+      end;
+  except
+    on E: Exception do Result := Result + ' (' + E.Message + ')';
+  end;
+  if Result = '' then Result := '(none)';
+end;
+
 { For the log: the UUIDs of the services Windows reported. }
 function ServiceList(Device: TBluetoothLEDevice): string;
 var
@@ -600,11 +637,13 @@ begin
     FailConnect(Attempt, 'This device has no RaceBox UART service.');
     Exit;
   end;
-  Rx := Svc.GetCharacteristic(FRxUUID);
-  Tx := Svc.GetCharacteristic(FTxUUID);
+  Rx := FindCharacteristic(Svc, FRxUUID);
+  Tx := FindCharacteristic(Svc, FTxUUID);
+  Log('UART service characteristics: ' + CharacteristicList(Svc));
   if (Rx = nil) or (Tx = nil) then
   begin
-    FailConnect(Attempt, 'RaceBox UART characteristics not found.');
+    FailConnect(Attempt, 'RaceBox UART characteristics not found (Windows reported: ' +
+      CharacteristicList(Svc) + ').');
     Exit;
   end;
   Log('Step 2/3: turning on RaceBox notifications...');
@@ -685,7 +724,7 @@ begin
     for I := Low(Ids) to High(Ids) do
     begin
       if not Alive.IsAlive or not IsCurrentAttempt(Attempt) then Exit;
-      Ch := Svc.GetCharacteristic(StringToGUID(Ids[I]));
+      Ch := FindCharacteristic(Svc, StringToGUID(Ids[I]));
       if Ch <> nil then
         Device.ReadCharacteristic(Ch);   // answer arrives in DoCharacteristicRead
     end;
