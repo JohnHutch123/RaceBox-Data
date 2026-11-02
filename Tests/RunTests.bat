@@ -49,6 +49,18 @@ if errorlevel 1 (
 )
 echo.
 
+echo === RaceBoxImportTest ===
+"%DCC%" %FLAGS% "%TESTDIR%\RaceBoxImportTest.dpr" > "%OUT%\RaceBoxImportTest.build.log" 2>&1
+if errorlevel 1 (
+  echo BUILD FAILED - see %OUT%\RaceBoxImportTest.build.log
+  findstr /I /C:"Error" /C:"Fatal" "%OUT%\RaceBoxImportTest.build.log"
+  set /a FAILED+=1
+) else (
+  "%OUT%\RaceBoxImportTest.exe"
+  if errorlevel 1 set /a FAILED+=1
+)
+echo.
+
 echo === RaceBoxReader demo (build only) ===
 pushd "%RB%\Demo"
 "%DCC%" %FLAGS% RaceBoxReader.dpr > "%OUT%\RaceBoxReader.build.log" 2>&1

@@ -9,6 +9,7 @@ uses
   RaceBox.Protocol in '..\Source\RaceBox.Protocol.pas',
   RaceBox.Session in '..\Source\RaceBox.Session.pas',
   RaceBox.BLE in '..\Source\RaceBox.BLE.pas',
+  RaceBox.Import in '..\Source\RaceBox.Import.pas',
   RaceBoxMain in 'RaceBoxMain.pas' {FormRaceBox};
 
 begin

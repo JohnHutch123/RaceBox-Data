@@ -15,9 +15,10 @@ later). No third-party libraries.
 |---|---|
 | `Source/RaceBox.Protocol.pas` | Packet framing, checksum, commands and decoders. No Bluetooth, also builds with Free Pascal. |
 | `Source/RaceBox.Session.pas` | Splits a download into sessions, CSV save/load, decodes a saved raw download. No Bluetooth. |
+| `Source/RaceBox.Import.pas` | Reads sessions exported from the RaceBox app/website (CSV, VBO, GPX). No Bluetooth. |
 | `Source/RaceBox.BLE.pas` | `TRaceBoxClient`: scan, connect, live data, unlock, download, erase. Delphi only. |
 | `Demo/RaceBoxReader.dpr` | Small VCL app that uses all of the above. |
-| `Tests/RaceBoxProtocolTest.dpr` | Console tests for the protocol and session units. |
+| `Tests/RaceBoxProtocolTest.dpr`, `Tests/RaceBoxImportTest.dpr` | Console tests. |
 
 ## Using the demo
 
@@ -32,6 +33,30 @@ later). No third-party libraries.
    **Save raw...** keeps the exact bytes received; **Open file...** decodes a raw file or a CSV again without the device.
 
 The RaceBox does not need to be paired in Windows settings first.
+
+## Sessions recorded with the RaceBox phone app
+
+Sessions recorded through the phone app are stored on the phone and in your
+RaceBox account, not on the device, so a Bluetooth download won't find them.
+Export them instead:
+
+1. Log in at racebox.pro and open **My Sessions** (sessions with no laps or
+   runs are hidden; the link at the bottom of the list shows them).
+2. Open a session, press the export button, and pick **CSV** (or VBO / GPX).
+   For CSV, include at least Time, Latitude, Longitude and Speed; add the
+   GForce, Gyro and Lap columns if they are offered.
+3. In the demo, press **Open file...** and pick one or more exported files.
+   Each file becomes a session; **Save CSV...** writes it in this project's
+   CSV format, so app sessions and Bluetooth downloads end up identical.
+
+In code: `Session := RaceBoxImportFile('export.csv', Info);`. `Info` says which
+columns were recognised, the speed unit and how the time was read.
+
+- **CSV:** columns are matched by name (RaceBox lets you choose them), and units are
+  read from names such as `Speed (mph)`. A speed column without a unit is taken as km/h;
+  change that with `TRaceBoxImportOptions.SpeedUnit`. Decimal commas aren't supported.
+- **VBO:** standard VBOX layout (positions in minutes, longitude positive west).
+- **GPX:** position and time only; speed and heading are worked out from the track.
 
 ## Using it in your own code
 
@@ -104,7 +129,8 @@ or with Free Pascal: `fpc -Mdelphi -Fu../Source RaceBoxProtocolTest.dpr`.
 `RaceBox.BLE` (it finds RAD Studio by itself, or set `BDS`).
 GitHub Actions runs the Free Pascal tests on every push (`.github/workflows/tests.yml`).
 
-They check every example packet in the RaceBox protocol document, the stream
+`RaceBoxImportTest` checks the CSV, VBO and GPX import on small hand-made files.
+The protocol tests check every example packet in the RaceBox protocol document, the stream
 parser (split and merged notifications, garbage, bad checksums), sample
 decoding, session splitting and the CSV round trip.
 

@@ -42,6 +42,7 @@ type
     function DurationSeconds: Double;
     function MaxSpeedKmh: Double;
     function DistanceMeters: Double;   // sum of hops between valid positions
+    function LapCount: Integer;        // distinct lap numbers > 0 (imported files)
     function Description: string;      // "2026-10-12 14:03:22  12:41  48210 samples"
     { File name friendly start time, e.g. 20261012_140322 }
     function FileStamp: string;
@@ -202,6 +203,20 @@ begin
   end;
 end;
 
+function TRaceBoxSession.LapCount: Integer;
+var
+  I, Last: Integer;
+begin
+  Result := 0;
+  Last := 0;
+  for I := 0 to FSamples.Count - 1 do
+    if (FSamples[I].Lap > 0) and (FSamples[I].Lap <> Last) then
+    begin
+      Inc(Result);
+      Last := FSamples[I].Lap;
+    end;
+end;
+
 function TRaceBoxSession.FileStamp: string;
 var
   T: TDateTime;
@@ -355,12 +370,12 @@ end;
 { ---------------------------------------------------------------- CSV }
 
 const
-  CsvColumns: array[0..26] of string = (
+  CsvColumns: array[0..27] of string = (
     'utc_time', 'unix_ms', 'itow_ms', 'latitude', 'longitude',
     'alt_msl_m', 'alt_wgs_m', 'speed_kmh', 'speed_ms', 'heading_deg',
     'fix', 'fix_ok', 'sats', 'pdop', 'h_acc_m', 'v_acc_m', 'speed_acc_ms',
     'heading_acc_deg', 'g_x', 'g_y', 'g_z', 'gyro_x_dps', 'gyro_y_dps', 'gyro_z_dps',
-    'battery_raw', 'fix_flags', 'latlon_flags');
+    'battery_raw', 'fix_flags', 'latlon_flags', 'lap');
 
 function RaceBoxCsvHeader: string;
 var
@@ -408,7 +423,8 @@ begin
     F(S.GyroZ, 2) + ',' +
     IntToStr(S.BatteryRaw) + ',' +
     IntToStr(S.FixStatusFlags) + ',' +
-    IntToStr(S.LatLonFlags);
+    IntToStr(S.LatLonFlags) + ',' +
+    IntToStr(S.Lap);
 end;
 
 procedure WriteLine(Stream: TStream; const Line: string);
@@ -521,6 +537,7 @@ begin
       S.BatteryRaw := Byte(Int(24));
       S.FixStatusFlags := Byte(Int(25));
       S.LatLonFlags := Byte(Int(26));
+      S.Lap := Integer(Int(27));
       if S.TimeValid then
       begin
         S.ValidityFlags := $03;

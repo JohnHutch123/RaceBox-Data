@@ -28,3 +28,5 @@ jobs:
           mkdir -p out
           fpc -Mdelphi -FuSource -FUout -FEout Tests/RaceBoxProtocolTest.dpr
           out/RaceBoxProtocolTest
+          fpc -Mdelphi -FuSource -FUout -FEout Tests/RaceBoxImportTest.dpr
+          out/RaceBoxImportTest
