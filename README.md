@@ -23,7 +23,9 @@ later). No third-party libraries.
 
 1. Open `Demo/RaceBoxReader.dpr` in RAD Studio 12 (it creates the `.dproj`), build for Win32 or Win64 and run.
 2. Switch the RaceBox on. **Close the RaceBox phone app** or turn off the phone's Bluetooth: the device takes one connection at a time.
-3. Press **Scan**, pick the RaceBox in the list, press **Connect**. Live data shows on the left.
+3. Press **Scan**, pick the RaceBox in the list, press **Connect**. The status bar counts the seconds while it
+   connects (the first connect can take 10-20 s); **Cancel** stops it, and it gives up by itself after 30 s.
+   Live data shows on the left once connected.
 4. If you set a memory security code in the RaceBox app, type it and press **Unlock** (needed after every connect).
 5. **Status** shows how many records are stored. **Download** fetches all of them; a full memory (196,608 records) takes a few minutes.
 6. Select sessions in the list (or none for all) and press **Save CSV...** to write one file per session.
@@ -43,7 +45,7 @@ FClient.OnLiveSample := LiveSample;        // TRaceBoxSample, 25 Hz
 FClient.OnDownloadComplete := DownloadDone;
 FClient.StartScan;
 ...
-FClient.Connect(Index);
+FClient.Connect(Index);                    // returns at once, connects in the background
 FClient.Unlock(123456);                    // only if security is on
 FClient.StartDownload;
 ...
@@ -56,7 +58,9 @@ begin
 end;
 ```
 
-Events run on the main thread, so you can touch the UI in them.
+Events run on the main thread, so you can touch the UI in them. `OnStateChanged` fires
+whenever `State` changes (scanning, connecting, connected...), which is the place to show a busy cursor.
+`ConnectTimeoutMs` (default 30000) sets how long a connect may take.
 
 ### `TRaceBoxSample`
 
