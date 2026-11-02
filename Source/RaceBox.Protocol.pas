@@ -122,6 +122,7 @@ type
     GyroX: Double;               // deg/s, roll
     GyroY: Double;               // deg/s, pitch
     GyroZ: Double;               // deg/s, yaw
+    Lap: Integer;                // lap number from an imported file; 0 if unknown
     function SpeedKmh: Double;
     function HasGoodFix: Boolean;      // 3D fix and "valid fix" flag
     function PositionValid: Boolean;   // lat/lon not flagged invalid and fix present

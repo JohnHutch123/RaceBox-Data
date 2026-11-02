@@ -14,7 +14,7 @@ interface
 uses
   Winapi.Windows, System.SysUtils, System.Classes, System.UITypes, System.Math, System.StrUtils,
   Vcl.Controls, Vcl.Forms, Vcl.StdCtrls, Vcl.ExtCtrls, Vcl.ComCtrls, Vcl.Dialogs,
-  RaceBox.Protocol, RaceBox.Session, RaceBox.BLE;
+  RaceBox.Protocol, RaceBox.Session, RaceBox.BLE, RaceBox.Import;
 
 type
   TFormRaceBox = class(TForm)
@@ -186,6 +186,7 @@ begin
   AddColumn('Distance km', 90);
   AddColumn('Max km/h', 80);
   AddColumn('Pauses', 60);
+  AddColumn('Laps', 50);
 
   // Ticks while scanning or connecting so the user sees the seconds go by.
   FBusyTimer := TTimer.Create(Self);
@@ -420,34 +421,86 @@ begin
   end;
 end;
 
+{ True for a CSV this program wrote (RaceBoxSaveCsv), which has a unix_ms column. }
+function IsOwnCsv(const FileName: string): Boolean;
+var
+  R: TStreamReader;
+begin
+  R := TStreamReader.Create(FileName, TEncoding.UTF8, True);
+  try
+    Result := Pos('unix_ms', R.ReadLine) > 0;
+  finally
+    R.Free;
+  end;
+end;
+
+{ Opens one or more files: raw downloads (.rbx), CSVs saved by this program,
+  and sessions exported from the RaceBox app or website (.csv, .vbo, .gpx).
+  Each exported file becomes one session in the list. }
 procedure TFormRaceBox.BtnOpenClick(Sender: TObject);
 var
   Dlg: TOpenDialog;
-  L: TRaceBoxSessionList;
+  L, Part: TRaceBoxSessionList;
   Session: TRaceBoxSession;
   Samples: TRaceBoxSampleList;
+  Name, Ext, Info: string;
+  I: Integer;
 begin
   Dlg := TOpenDialog.Create(nil);
   try
-    Dlg.Filter := 'RaceBox raw download or CSV (*.rbx;*.csv)|*.rbx;*.csv|All files|*.*';
+    Dlg.Title := 'Open RaceBox files (exports from the RaceBox app/website, or saved here)';
+    Dlg.Filter := 'RaceBox files (*.csv;*.vbo;*.gpx;*.rbx)|*.csv;*.vbo;*.gpx;*.rbx|All files|*.*';
+    Dlg.Options := Dlg.Options + [ofAllowMultiSelect, ofFileMustExist];
     if not Dlg.Execute then Exit;
-    if SameText(ExtractFileExt(Dlg.FileName), '.csv') then
-    begin
-      Samples := RaceBoxLoadCsv(Dlg.FileName);
-      try
-        L := TRaceBoxSessionList.Create(True);
-        Session := TRaceBoxSession.Create;
-        Session.Samples.AddRange(Samples);
-        L.Add(Session);
-      finally
-        Samples.Free;
+    Screen.Cursor := crHourGlass;
+    L := TRaceBoxSessionList.Create(True);
+    try
+      for I := 0 to Dlg.Files.Count - 1 do
+      begin
+        Name := Dlg.Files[I];
+        Ext := LowerCase(ExtractFileExt(Name));
+        try
+          if Ext = '.rbx' then
+          begin
+            Part := RaceBoxLoadDumpFile(Name, FClient.MaxGapSeconds);
+            try
+              while Part.Count > 0 do
+                L.Add(Part.Extract(Part[0]));
+            finally
+              Part.Free;
+            end;
+            ClientLog(Self, 'Opened raw download ' + Name);
+          end
+          else if (Ext = '.csv') and IsOwnCsv(Name) then
+          begin
+            Samples := RaceBoxLoadCsv(Name);
+            try
+              Session := TRaceBoxSession.Create;
+              Session.Samples.AddRange(Samples);
+              L.Add(Session);
+            finally
+              Samples.Free;
+            end;
+            ClientLog(Self, 'Opened ' + Name);
+          end
+          else
+          begin
+            L.Add(RaceBoxImportFile(Name, Info));
+            ClientLog(Self, 'Imported ' + Info);
+          end;
+        except
+          on E: Exception do
+            ClientLog(Self, 'ERROR: could not open ' + Name + ': ' + E.Message);
+        end;
       end;
-    end
-    else
-      L := RaceBoxLoadDumpFile(Dlg.FileName, FClient.MaxGapSeconds);
-    ShowSessions(L);
-    ClientLog(Self, Format('Opened %s: %d session(s).', [Dlg.FileName, L.Count]));
+      ShowSessions(L);
+    except
+      L.Free;
+      raise;
+    end;
+    FStatus.SimpleText := Format('Opened %d session(s). Select rows and press Save CSV to convert them.', [FSessions.Count]);
   finally
+    Screen.Cursor := crDefault;
     Dlg.Free;
   end;
 end;
@@ -478,6 +531,7 @@ begin
       Item.SubItems.Add(FormatFloat('0.00', S.DistanceMeters / 1000));
       Item.SubItems.Add(FormatFloat('0', S.MaxSpeedKmh));
       Item.SubItems.Add(IntToStr(S.PauseCount));
+      Item.SubItems.Add(IntToStr(S.LapCount));
     end;
   finally
     FSessionView.Items.EndUpdate;
